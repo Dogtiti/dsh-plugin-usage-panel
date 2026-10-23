@@ -35,7 +35,7 @@ function resolveSettings(config) {
   const merged = {
     apiKeyEnv: 'ZAI_CODING_CN_API_KEY',
     baseUrl: 'https://api.z.ai',
-    refreshSeconds: 60,
+    refreshSeconds: 20,
   }
   if (typeof config.apiKeyEnv === 'string' && config.apiKeyEnv !== '') merged.apiKeyEnv = config.apiKeyEnv
   if (typeof config.baseUrl === 'string' && /^https?:\/\//.test(config.baseUrl)) {

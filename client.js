@@ -1,10 +1,11 @@
 /**
- * Client half of the GLM quota bundle.
+ * Client half of the usage panel.
  *
- * The dock entry is a one-chip trigger; clicking it opens a popover card shaped like
- * the ZCode client's quota panel: the plan level, one column per window (label, the
- * remaining share, the reset date, a thin bar), and the refresh time. The Host half
- * owns the API key and the upstream call; this half only reads its snapshot.
+ * The dock entry is one word next to the model selector: no numbers, no polling.
+ * Clicking it reads the quota once (the Host answers from its cache unless asked to
+ * refresh, so the click forces a fresh upstream read) and shows the ZCode-shaped card.
+ * The entry only appears when the composer's model control names GLM, which is the
+ * one signal the harness renders for the selected model.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-plugin-usage-panel',
@@ -15,10 +16,7 @@ window.__ModuleLoader__.load({
     /** Route registered by the Host half, addressed document-relatively. */
     const ROUTE = 'api/usage-panel'
 
-    /** How often the popover refreshes while the page stays open. */
-    const POLL_MS = 15000
-
-    /** Windows in display order, with the accent the ZCode panel uses for each. */
+    /** Windows in display order, with the accent the reference panel uses. */
     const WINDOWS = [
       { id: 'fiveHour', accent: '#2f6fed' },
       { id: 'weekly', accent: '#16a34a' },
@@ -37,7 +35,10 @@ window.__ModuleLoader__.load({
         failed: '额度不可用',
         remaining: '剩余',
         updated: '更新于',
-        show: '查看 GLM 额度',
+        show: '查看额度',
+        chip: '额度',
+        loading: '读取中…',
+        unconfigured: '未配置 API Key',
       },
       en: {
         fiveHour: '5h',
@@ -49,31 +50,22 @@ window.__ModuleLoader__.load({
         failed: 'Quota unavailable',
         remaining: 'remaining',
         updated: 'Updated',
-        show: 'Show GLM quota',
+        show: 'Show quota',
+        chip: 'Usage',
+        loading: 'Reading…',
+        unconfigured: 'No API key',
       },
     }
 
-    /** Card geometry, so the popover reads like the reference panel. */
-    const CARD = {
-      width: '352px',
-      radius: '14px',
-      padding: '16px 18px 12px',
-    }
-
     /**
-     * The model the composer is actually showing.
-     *
-     * The Host exposes no current-model selection to plugins: `agentDefaultModel`
-     * resolves to undefined here, the session snapshot and projections carry no model
-     * field, and the model slot's owner props are only `{locked}`. The rendered label is
-     * therefore the single trustworthy source, and an unreadable label hides the panel
-     * rather than guessing.
-     * @returns {string} the label text, or '' when it cannot be read.
+     * The model the composer is actually showing, read from the model control's
+     * accessible name. The Harness exposes no per-session model to plugins, so this
+     * is the only signal that matches what the user sees; an unreadable label hides
+     * the entry rather than guessing.
+     * @returns {string} the model name, or '' when unreadable.
      */
     function composerModelText() {
       try {
-        /* The model control carries an accessible label naming the current model in
-         * both shipped languages, which is far steadier than the hashed CSS classes. */
         const node =
           document.querySelector('[aria-label^="选择模型"]') ??
           document.querySelector('[aria-label*="当前:"]') ??
@@ -89,15 +81,13 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Format a reset timestamp the way the reference panel does: month and day,
-     * written in the active interface language rather than the browser default.
+     * Format a reset timestamp as a date in the active interface language.
      * @param {number} ms - epoch milliseconds.
-     * @param {string} active - active locale id.
      * @returns {string} a localized short date, or an empty string.
      */
-    function formatReset(ms, active) {
+    function formatReset(ms) {
       try {
-        const tag = String(active ?? '').toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US'
+        const tag = String(document.documentElement.lang ?? '').toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US'
         return new Date(ms).toLocaleDateString(tag, { month: 'long', day: 'numeric' })
       } catch {
         return ''
@@ -118,9 +108,9 @@ window.__ModuleLoader__.load({
      * One column of the card: label, value with its reset date, then the bar.
      * @param {{ win: any, accent: string, t: (key: string) => string }} props
      */
-    function Column({ win, accent, t, active }) {
+    function Column({ win, accent, t }) {
       const remaining = remainingOf(win)
-      const reset = typeof win.resetAt === 'number' ? formatReset(win.resetAt, active) : ''
+      const reset = typeof win.resetAt === 'number' ? formatReset(win.resetAt) : ''
       return h(
         'div',
         { style: { display: 'flex', flexDirection: 'column', gap: '6px', minWidth: 0, flex: '1 1 0' } },
@@ -128,23 +118,6 @@ window.__ModuleLoader__.load({
           'div',
           { style: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', opacity: 0.7 } },
           h('span', null, t(win.id)),
-          reset === ''
-            ? null
-            : h(
-                'span',
-                {
-                  style: {
-                    fontSize: '10px',
-                    lineHeight: '14px',
-                    padding: '0 5px',
-                    borderRadius: '999px',
-                    background: 'rgba(22,163,74,0.12)',
-                    color: '#15803d',
-                    whiteSpace: 'nowrap',
-                  },
-                },
-                t('resets'),
-              ),
         ),
         h(
           'div',
@@ -190,50 +163,51 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The dock entry: a chip that opens the quota card.
-     * @param {{ t: (key: string) => string, locale: { subscribe: Function, getSnapshot: Function } }} props
+     * The dock entry: a word that opens the quota card on demand.
+     * @param {{ t: (key: string) => string, locale: { subscribe: Function, getSnapshot: Function }, sessionId?: string }} props
      */
     function QuotaEntry({ t, locale, sessionId }) {
       const [snapshot, setSnapshot] = React.useState(null)
       const [open, setOpen] = React.useState(false)
       const [modelText, setModelText] = React.useState(() => composerModelText())
       const rootRef = React.useRef(null)
+      const closeTimer = React.useRef(null)
       /* Re-render on a language switch so the labels follow the app. */
       React.useSyncExternalStore(locale.subscribe, locale.getSnapshot, locale.getSnapshot)
 
-      React.useEffect(() => {
-        let alive = true
-        const read = async () => {
-          try {
-            /* The session decides the model: a session keeps the model it was switched
-             * to, which is not necessarily the composer's default. */
-            const query = typeof sessionId === 'string' && sessionId !== '' ? `?session=${encodeURIComponent(sessionId)}` : ''
-            const response = await fetch(`${ROUTE}${query}`, { headers: { accept: 'application/json' } })
-            const body = await response.json()
-            if (alive) setSnapshot(body)
-          } catch (error) {
-            if (alive) setSnapshot({ configured: true, error: 'unreachable', message: String(error?.message ?? error) })
-          }
-        }
-        void read()
-        const timer = setInterval(() => void read(), POLL_MS)
-        const onFocus = () => void read()
-        window.addEventListener('focus', onFocus)
-        return () => {
-          alive = false
-          clearInterval(timer)
-          window.removeEventListener('focus', onFocus)
-        }
-      }, [sessionId])
-
-      /* The label changes without a re-render here, so poll it cheaply. */
+      /* The label changes without a re-render here; a cheap read keeps the gate honest. */
       React.useEffect(() => {
         const timer = setInterval(() => setModelText(composerModelText()), 2000)
         return () => clearInterval(timer)
       }, [])
 
+      React.useEffect(
+        () => () => {
+          if (closeTimer.current !== null) clearTimeout(closeTimer.current)
+        },
+        [],
+      )
+
+      /* Read the quota exactly once per opening, bypassing the Host cache. */
       React.useEffect(() => {
         if (open !== true) return undefined
+        let alive = true
+        void (async () => {
+          try {
+            const params = []
+            if (typeof sessionId === 'string' && sessionId !== '') {
+              params.push(`session=${encodeURIComponent(sessionId)}`)
+            }
+            params.push('refresh=1')
+            const response = await fetch(`${ROUTE}?${params.join('&')}`, { headers: { accept: 'application/json' } })
+            const body = await response.json()
+            if (alive) setSnapshot(body)
+          } catch (error) {
+            if (alive) {
+              setSnapshot({ configured: true, error: 'unreachable', message: String(error?.message ?? error) })
+            }
+          }
+        })()
         const onPointer = (event) => {
           if (rootRef.current !== null && rootRef.current.contains(event.target) !== true) setOpen(false)
         }
@@ -243,57 +217,55 @@ window.__ModuleLoader__.load({
         document.addEventListener('pointerdown', onPointer)
         document.addEventListener('keydown', onKey)
         return () => {
+          alive = false
           document.removeEventListener('pointerdown', onPointer)
           document.removeEventListener('keydown', onKey)
         }
-      }, [open])
+      }, [open, sessionId])
 
-      if (snapshot === null || snapshot.configured === false) return null
-      /* Only the GLM coding plan has a quota here; any other selection prints nothing. */
+      /* Any other model has no coding-plan quota here. */
       if (!/glm/i.test(modelText)) return null
-      const windows = Array.isArray(snapshot.windows) ? snapshot.windows : []
+
+      const windows = Array.isArray(snapshot?.windows) ? snapshot.windows : []
       const columns = WINDOWS.map((entry) => ({ entry, win: windows.find((win) => win.id === entry.id) })).filter(
         (pair) => pair.win !== undefined,
       )
-      const failed = typeof snapshot.error === 'string'
-      if (failed !== true && columns.length === 0) return null
-
-      /* The chip headlines the tightest window, so the number has a meaning. */
-      const tightest = columns
-        .map((pair) => remainingOf(pair.win))
-        .filter((value) => value !== null)
-        .reduce((low, value) => (low === null || value < low ? value : low), null)
-      /* The effort is only truthful when the configured default names the model on
-       * screen; otherwise the session runs something the selection does not describe. */
-      const effort =
-        snapshot.defaultSelection !== null &&
-        snapshot.defaultSelection !== undefined &&
-        typeof snapshot.defaultSelection.model === 'string' &&
-        snapshot.defaultSelection.model === modelText.trim() &&
-        typeof snapshot.defaultSelection.reasoningEffort === 'string'
-          ? snapshot.defaultSelection.reasoningEffort
-          : null
-      const chipColor =
-        tightest === null ? 'var(--dsh-text-secondary, #6b7280)' : tightest <= 10 ? '#dc2626' : tightest <= 30 ? '#d97706' : '#16a34a'
+      const failed = typeof snapshot?.error === 'string'
+      const missing = snapshot !== null && snapshot.configured === false
 
       return h(
         'div',
-        { ref: rootRef, style: { position: 'relative', display: 'inline-flex', justifyContent: 'flex-end' } },
+        {
+          ref: rootRef,
+          style: { position: 'relative', display: 'inline-flex', justifyContent: 'flex-end' },
+          onMouseEnter: () => {
+            if (closeTimer.current !== null) {
+              clearTimeout(closeTimer.current)
+              closeTimer.current = null
+            }
+            setOpen(true)
+          },
+          onMouseLeave: () => {
+            if (closeTimer.current !== null) clearTimeout(closeTimer.current)
+            closeTimer.current = setTimeout(() => {
+              closeTimer.current = null
+              setOpen(false)
+            }, 160)
+          },
+        },
         h(
           'button',
           {
             type: 'button',
             'aria-haspopup': 'dialog',
             'aria-expanded': open,
-            title: [t('show'), effort === null ? '' : `${t('effort')} ${effort}`].filter((part) => part !== '').join(' · '),
+            title: t('show'),
             onClick: (event) => {
               event.preventDefault()
-              setOpen((value) => !value)
+              setOpen(true)
             },
+            onFocus: () => setOpen(true),
             style: {
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '6px',
               padding: '1px 8px',
               borderRadius: '999px',
               border: '1px solid var(--dsh-border-subtle, rgba(120,120,120,0.22))',
@@ -305,21 +277,7 @@ window.__ModuleLoader__.load({
               cursor: 'pointer',
             },
           },
-          h('span', { style: { width: '6px', height: '6px', borderRadius: '50%', background: chipColor } }),
-          h('span', null, 'GLM'),
-          tightest === null
-            ? null
-            : h(
-                'span',
-                {
-                  style: {
-                    fontWeight: 600,
-                    fontVariantNumeric: 'tabular-nums',
-                    color: 'var(--dsh-text-primary, #111827)',
-                  },
-                },
-                `${String(tightest)}%`,
-              ),
+          t('chip'),
         ),
         open !== true
           ? null
@@ -333,9 +291,9 @@ window.__ModuleLoader__.load({
                   right: 0,
                   bottom: '100%',
                   marginBottom: '8px',
-                  width: CARD.width,
-                  padding: CARD.padding,
-                  borderRadius: CARD.radius,
+                  width: '352px',
+                  padding: '16px 18px 12px',
+                  borderRadius: '14px',
                   border: '1px solid var(--dsh-border-strong, rgba(0,0,0,0.10))',
                   background: 'var(--dsh-surface-overlay, #ffffff)',
                   boxShadow: '0 12px 32px rgba(0,0,0,0.16)',
@@ -346,17 +304,9 @@ window.__ModuleLoader__.load({
               },
               h(
                 'div',
-                {
-                  style: {
-                    display: 'flex',
-                    alignItems: 'baseline',
-                    justifyContent: 'space-between',
-                    gap: '12px',
-                    marginBottom: '14px',
-                  },
-                },
+                { style: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '12px', marginBottom: '14px' } },
                 h('span', { style: { fontSize: '14px', fontWeight: 600 } }, t('title')),
-                typeof snapshot.level === 'string' && snapshot.level !== ''
+                typeof snapshot?.level === 'string' && snapshot.level !== ''
                   ? h(
                       'span',
                       {
@@ -372,21 +322,17 @@ window.__ModuleLoader__.load({
                     )
                   : null,
               ),
-              failed === true
-                ? h('div', { style: { fontSize: '12px', opacity: 0.6 } }, `${t('failed')} · ${snapshot.error}`)
-                : h(
-                    'div',
-                    { style: { display: 'flex', alignItems: 'flex-start', gap: '18px' } },
-                    ...columns.map((pair) =>
-                      h(Column, {
-                        key: pair.entry.id,
-                        win: pair.win,
-                        accent: pair.entry.accent,
-                        t,
-                        active: locale.getSnapshot().active,
-                      }),
-                    ),
-                  ),
+              snapshot === null
+                ? h('div', { style: { fontSize: '12px', opacity: 0.6 } }, t('loading'))
+                : missing === true
+                  ? h('div', { style: { fontSize: '12px', opacity: 0.6 } }, t('unconfigured'))
+                  : failed === true
+                    ? h('div', { style: { fontSize: '12px', opacity: 0.6 } }, `${t('failed')} · ${snapshot.error}`)
+                    : h(
+                        'div',
+                        { style: { display: 'flex', alignItems: 'flex-start', gap: '18px' } },
+                        ...columns.map((pair) => h(Column, { key: pair.entry.id, win: pair.win, accent: pair.entry.accent, t })),
+                      ),
               h(
                 'div',
                 {
@@ -400,15 +346,8 @@ window.__ModuleLoader__.load({
                     opacity: 0.5,
                   },
                 },
-                h('span', null, t('updated')),
-                h(
-                  'span',
-                  null,
-                  new Date(snapshot.fetchedAt ?? Date.now()).toLocaleTimeString(
-                    String(locale.getSnapshot().active ?? '').toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US',
-                    { hour: '2-digit', minute: '2-digit' },
-                  ),
-                ),
+                h('span', null, t('remaining')),
+                h('span', null, snapshot === null ? '—' : new Date(snapshot.fetchedAt ?? Date.now()).toLocaleTimeString()),
               ),
             ),
       )
@@ -420,7 +359,6 @@ window.__ModuleLoader__.load({
         ctx.effect(() => ctx.locale.register('usage-panel', 'zh', TEXT.zh))
         ctx.effect(() => ctx.locale.register('usage-panel', 'en', TEXT.en))
         const t = ctx.locale.bind('usage-panel')
-        /* Bind the service methods: passing them detached loses `this`. */
         const locale = {
           subscribe: (listener) => ctx.locale.subscribe(listener),
           getSnapshot: () => ctx.locale.getSnapshot(),
