@@ -16,6 +16,15 @@ window.__ModuleLoader__.load({
     /** Route registered by the Host half, addressed document-relatively. */
     const ROUTE = 'api/usage-panel'
 
+    /** A hover must last this long before it counts, so pass-through never fetches. */
+    const HOVER_DELAY_MS = 150
+
+    /** At most one upstream read per window, however often the pointer re-enters. */
+    const MIN_FETCH_MS = 8000
+
+    /** Grace period before closing, so the pointer can travel from the icon into the card. */
+    const CLOSE_DELAY_MS = 160
+
     /** Windows in display order, with the accent the reference panel uses. */
     const WINDOWS = [
       { id: 'fiveHour', accent: '#2f6fed' },
@@ -169,9 +178,13 @@ window.__ModuleLoader__.load({
     function QuotaEntry({ t, locale, sessionId }) {
       const [snapshot, setSnapshot] = React.useState(null)
       const [open, setOpen] = React.useState(false)
+      const [hovered, setHovered] = React.useState(false)
       const [modelText, setModelText] = React.useState(() => composerModelText())
       const rootRef = React.useRef(null)
       const closeTimer = React.useRef(null)
+      const openTimer = React.useRef(null)
+      const inFlight = React.useRef(false)
+      const cache = React.useRef({ at: 0, body: null })
       /* Re-render on a language switch so the labels follow the app. */
       React.useSyncExternalStore(locale.subscribe, locale.getSnapshot, locale.getSnapshot)
 
@@ -184,6 +197,7 @@ window.__ModuleLoader__.load({
       React.useEffect(
         () => () => {
           if (closeTimer.current !== null) clearTimeout(closeTimer.current)
+          if (openTimer.current !== null) clearTimeout(openTimer.current)
         },
         [],
       )
@@ -192,22 +206,32 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (open !== true) return undefined
         let alive = true
-        void (async () => {
-          try {
-            const params = []
-            if (typeof sessionId === 'string' && sessionId !== '') {
-              params.push(`session=${encodeURIComponent(sessionId)}`)
+        /* A snapshot younger than the window is served from memory: re-hovering a few
+         * times in a row must not hammer the upstream endpoint. */
+        if (cache.current.body !== null && Date.now() - cache.current.at < MIN_FETCH_MS) {
+          setSnapshot(cache.current.body)
+        } else if (inFlight.current !== true) {
+          inFlight.current = true
+          void (async () => {
+            try {
+              const params = []
+              if (typeof sessionId === 'string' && sessionId !== '') {
+                params.push(`session=${encodeURIComponent(sessionId)}`)
+              }
+              params.push('refresh=1')
+              const response = await fetch(`${ROUTE}?${params.join('&')}`, { headers: { accept: 'application/json' } })
+              const body = await response.json()
+              cache.current = { at: Date.now(), body }
+              if (alive) setSnapshot(body)
+            } catch (error) {
+              if (alive) {
+                setSnapshot({ configured: true, error: 'unreachable', message: String(error?.message ?? error) })
+              }
+            } finally {
+              inFlight.current = false
             }
-            params.push('refresh=1')
-            const response = await fetch(`${ROUTE}?${params.join('&')}`, { headers: { accept: 'application/json' } })
-            const body = await response.json()
-            if (alive) setSnapshot(body)
-          } catch (error) {
-            if (alive) {
-              setSnapshot({ configured: true, error: 'unreachable', message: String(error?.message ?? error) })
-            }
-          }
-        })()
+          })()
+        }
         const onPointer = (event) => {
           if (rootRef.current !== null && rootRef.current.contains(event.target) !== true) setOpen(false)
         }
@@ -243,14 +267,22 @@ window.__ModuleLoader__.load({
               clearTimeout(closeTimer.current)
               closeTimer.current = null
             }
-            setOpen(true)
+            if (openTimer.current !== null) return
+            openTimer.current = setTimeout(() => {
+              openTimer.current = null
+              setOpen(true)
+            }, HOVER_DELAY_MS)
           },
           onMouseLeave: () => {
+            if (openTimer.current !== null) {
+              clearTimeout(openTimer.current)
+              openTimer.current = null
+            }
             if (closeTimer.current !== null) clearTimeout(closeTimer.current)
             closeTimer.current = setTimeout(() => {
               closeTimer.current = null
               setOpen(false)
-            }, 160)
+            }, CLOSE_DELAY_MS)
           },
         },
         h(
@@ -259,6 +291,7 @@ window.__ModuleLoader__.load({
             type: 'button',
             'aria-haspopup': 'dialog',
             'aria-expanded': open,
+            'aria-label': t('show'),
             title: t('show'),
             onClick: (event) => {
               event.preventDefault()
@@ -266,18 +299,32 @@ window.__ModuleLoader__.load({
             },
             onFocus: () => setOpen(true),
             style: {
-              padding: '1px 8px',
-              borderRadius: '999px',
-              border: '1px solid var(--dsh-border-subtle, rgba(120,120,120,0.22))',
-              background: 'transparent',
-              color: 'var(--dsh-text-secondary, #6b7280)',
-              fontFamily: 'inherit',
-              fontSize: '11px',
-              lineHeight: '16px',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '22px',
+              height: '22px',
+              padding: 0,
+              borderRadius: '6px',
+              border: 'none',
+              background: hovered === true || open === true ? 'var(--dsh-surface-raised, rgba(120,120,120,0.10))' : 'transparent',
+              color: hovered === true || open === true
+                ? 'var(--dsh-text-primary, #111827)'
+                : 'var(--dsh-text-secondary, #6b7280)',
               cursor: 'pointer',
+              transition: 'background 120ms ease, color 120ms ease',
             },
+            onMouseEnter: () => setHovered(true),
+            onMouseLeave: () => setHovered(false),
           },
-          t('chip'),
+          /* A small bar-chart mark: three ascending bars, drawn inline so no asset load is needed. */
+          h(
+            'svg',
+            { width: '15', height: '15', viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' },
+            h('rect', { x: '2.4', y: '8.6', width: '2.7', height: '5.0', rx: '1', fill: 'currentColor' }),
+            h('rect', { x: '6.65', y: '5.4', width: '2.7', height: '8.2', rx: '1', fill: 'currentColor' }),
+            h('rect', { x: '10.9', y: '2.4', width: '2.7', height: '11.2', rx: '1', fill: 'currentColor' }),
+          ),
         ),
         open !== true
           ? null

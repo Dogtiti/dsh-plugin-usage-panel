@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-usage-panel",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "A usage panel for provider plans: shows how much of each quota window is left (GLM Coding Plan today) as a compact chip next to the model selector, with a detail popover.",
   "keywords": [
