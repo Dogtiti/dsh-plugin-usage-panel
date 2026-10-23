@@ -1,0 +1,7 @@
+- insert:
+    - id: usage-panel
+      name: 'dsh-plugin-usage-panel'
+      config:
+        apiKeyEnv: ZAI_CODING_CN_API_KEY
+        baseUrl: https://api.z.ai
+        refreshSeconds: 60

@@ -1,0 +1,16 @@
+{
+  "meta": {
+    "title": "Usage Panel",
+    "description": "Shows how much of each provider quota window is left, as a chip next to the model selector with a detail popover. GLM Coding Plan today."
+  },
+  "fiveHour": "5h",
+  "weekly": "Week",
+  "tools": "Tools",
+  "level": "Plan",
+  "resets": "resets",
+  "noReset": "no reset scheduled",
+  "unconfigured": "No Zhipu API key",
+  "failed": "Quota unavailable",
+  "updated": "Updated",
+  "remaining": "remaining"
+}
