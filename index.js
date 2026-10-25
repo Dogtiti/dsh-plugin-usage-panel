@@ -1,13 +1,17 @@
 /**
- * Host half of the GLM quota bundle.
+ * Host half of the usage panel.
  *
- * The ZCode client reads the coding-plan quota from
- * `GET <base>/api/monitor/usage/quota/limit` with the API key in an
- * `authorization` header. That endpoint answers three windows for a coding plan:
- * a 5-hour token window, a weekly token window, and the tool-call budget. This
- * half resolves the key through the Host credential service, calls the endpoint,
- * normalizes the windows, and serves the snapshot on `/api/glm-quota` for the
- * browser half. The key never leaves the Host process.
+ * Two plans are read today, from the same endpoints each vendor's own client uses:
+ *
+ *  - Zhipu GLM Coding Plan — `GET <base>/api/monitor/usage/quota/limit`, which returns
+ *    a 5-hour token window, a weekly token window and the tool-call budget.
+ *  - OpenCode Zen (Go) — `GET <base>/usage`, which returns rolling, weekly and monthly
+ *    percentages together with the moment each window resets.
+ *
+ * The provider is taken from the session's own `model/selection` events, so the panel
+ * follows the model the session is really running rather than the composer default.
+ * Keys are resolved through the Host credential service and never leave this process:
+ * the browser half only ever sees normalized windows.
  */
 
 /** Route registered for the browser half; it is addressed document-relatively. */
@@ -22,8 +26,11 @@ const REQUEST_TIMEOUT_MS = 8000
 /**
  * @typedef {object} QuotaSettings
  * @property {string} apiKeyEnv - credential reference holding the Zhipu key.
- * @property {string} baseUrl - API origin, without a trailing slash.
+ * @property {string} baseUrl - Zhipu API origin, without a trailing slash.
  * @property {number} refreshSeconds - cache lifetime for one upstream read.
+ * @property {'auto' | 'glm' | 'opencode'} source - which plan to read.
+ * @property {string} opencodeApiKeyEnv - credential reference holding the OpenCode key.
+ * @property {string} opencodeBaseUrl - OpenCode API origin, without a trailing slash.
  */
 
 /**
@@ -36,10 +43,22 @@ function resolveSettings(config) {
     apiKeyEnv: 'ZAI_CODING_CN_API_KEY',
     baseUrl: 'https://api.z.ai',
     refreshSeconds: 20,
+    source: 'auto',
+    opencodeApiKeyEnv: 'OPENCODE_GO_API_KEY',
+    opencodeBaseUrl: 'https://opencode.ai/zen/go/v1',
   }
   if (typeof config.apiKeyEnv === 'string' && config.apiKeyEnv !== '') merged.apiKeyEnv = config.apiKeyEnv
   if (typeof config.baseUrl === 'string' && /^https?:\/\//.test(config.baseUrl)) {
     merged.baseUrl = config.baseUrl.replace(/\/+$/, '')
+  }
+  if (typeof config.opencodeApiKeyEnv === 'string' && config.opencodeApiKeyEnv !== '') {
+    merged.opencodeApiKeyEnv = config.opencodeApiKeyEnv
+  }
+  if (typeof config.opencodeBaseUrl === 'string' && /^https?:\/\//.test(config.opencodeBaseUrl)) {
+    merged.opencodeBaseUrl = config.opencodeBaseUrl.replace(/\/+$/, '')
+  }
+  if (config.source === 'glm' || config.source === 'opencode' || config.source === 'auto') {
+    merged.source = config.source
   }
   const refresh = Number(config.refreshSeconds)
   if (Number.isFinite(refresh)) merged.refreshSeconds = Math.max(MIN_REFRESH_SECONDS, Math.round(refresh))
@@ -71,11 +90,11 @@ function describeLimit(limit) {
 }
 
 /**
- * Turn an upstream body into the snapshot the panel consumes.
- * @param {any} body - parsed `quota/limit` response.
+ * Turn a Zhipu `quota/limit` body into the snapshot the panel consumes.
+ * @param {any} body - parsed response.
  * @returns {{ level: string | null, windows: any[] }} normalized snapshot.
  */
-function normalizeSnapshot(body) {
+function normalizeGlm(body) {
   const data = body?.data ?? {}
   const limits = Array.isArray(data.limits) ? data.limits : []
   const windows = limits.map(describeLimit).filter((entry) => entry !== undefined)
@@ -85,15 +104,48 @@ function normalizeSnapshot(body) {
 }
 
 /**
- * Whether a provider/model pair belongs to the GLM coding plan.
+ * Turn an OpenCode `/usage` body into the same shape. OpenCode reports how much of a
+ * window was **used**, which matches the Zhipu payload, so both stay in one convention.
+ * @param {any} body - parsed response.
+ * @returns {{ level: string | null, windows: any[] }} normalized snapshot.
+ */
+function normalizeOpencode(body) {
+  const usage = body?.usage ?? {}
+  const order = [
+    ['rolling', 'fiveHour'],
+    ['weekly', 'weekly'],
+    ['monthly', 'monthly'],
+  ]
+  const windows = []
+  for (const [key, id] of order) {
+    const window = usage[key]
+    if (window === null || typeof window !== 'object') continue
+    const resetAt = Date.parse(String(window.resetsAt ?? ''))
+    windows.push({
+      id,
+      type: key,
+      ...(typeof window.percent === 'number' ? { usedPercent: window.percent } : {}),
+      ...(Number.isFinite(resetAt) ? { resetAt } : {}),
+      ...(typeof window.status === 'string' ? { status: window.status } : {}),
+    })
+  }
+  return { level: typeof body?.plan === 'string' ? body.plan : null, windows }
+}
+
+/**
+ * Which plan a provider/model pair belongs to.
  * @param {unknown} provider - provider id.
  * @param {unknown} model - model id.
- * @returns {boolean} true when either id names GLM or Z.ai.
+ * @returns {'glm' | 'opencode' | null} the plan, or null when neither applies.
  */
-function isGlmPair(provider, model) {
-  return [provider, model].some(
-    (value) => typeof value === 'string' && /zai|glm|zhipu|bigmodel/i.test(value),
-  )
+function sourceFor(provider, model) {
+  if (typeof provider === 'string' && /opencode/i.test(provider)) return 'opencode'
+  if (typeof provider === 'string' && /zai|glm|zhipu|bigmodel/i.test(provider)) return 'glm'
+  /* Fall back to the model name only when the provider id says nothing at all. */
+  if ((provider === null || provider === undefined) && typeof model === 'string' && /glm/i.test(model)) {
+    return 'glm'
+  }
+  return null
 }
 
 /**
@@ -103,7 +155,7 @@ function isGlmPair(provider, model) {
  * session that is running something else.
  * @param {import('@deepseek-ai/cordis').Context} ctx - owning context.
  * @param {string | undefined} sessionId - session the panel belongs to.
- * @returns {{ provider: string | null, model: string | null, isGlm: boolean, source: string }} selection.
+ * @returns {{ provider: string | null, model: string | null, origin: 'session' | 'default' | 'error' }} selection.
  */
 function currentModel(ctx, sessionId) {
   try {
@@ -117,15 +169,15 @@ function currentModel(ctx, sessionId) {
       if (latest !== undefined) {
         const provider = typeof latest.provider === 'string' ? latest.provider : null
         const model = typeof latest.model === 'string' ? latest.model : null
-        return { provider, model, isGlm: isGlmPair(provider, model), source: 'session' }
+        return { provider, model, origin: 'session' }
       }
     }
     const fallback = ctx.get('agentDefaultModel')?.currentSelection?.()
     const provider = typeof fallback?.provider === 'string' ? fallback.provider : null
     const model = typeof fallback?.model === 'string' ? fallback.model : null
-    return { provider, model, isGlm: isGlmPair(provider, model), source: 'default' }
+    return { provider, model, origin: 'default' }
   } catch {
-    return { provider: null, model: null, isGlm: false, source: 'error' }
+    return { provider: null, model: null, origin: 'error' }
   }
 }
 
@@ -136,78 +188,121 @@ function currentModel(ctx, sessionId) {
  */
 export function apply(ctx, config = {}) {
   const settings = resolveSettings(config)
-  let cached = null
-  let cachedAt = 0
+  /** One cache entry per plan: asking for GLM must not evict the OpenCode answer. */
+  const cache = new Map()
 
   /**
-   * Read the quota once per cache window.
-   * @param {boolean} force - ignore a fresh cache entry.
-   * @returns {Promise<object>} the snapshot payload.
+   * Resolve the credential a plan needs.
+   * @param {string} reference - credential name.
+   * @returns {Promise<{ value?: string, missing?: boolean, reason?: string }>} resolution.
    */
-  async function readQuota(force, sessionId) {
-    const now = Date.now()
-    if (force !== true && cached !== null && now - cachedAt < settings.refreshSeconds * 1000) {
-      return { ...cached, activeModel: currentModel(ctx, sessionId) }
-    }
-
+  async function resolveKey(reference) {
     const credentials = ctx.get('credentials')
-    if (credentials === undefined) return { configured: false, reason: 'credentials-unavailable' }
+    if (credentials === undefined) return { reason: 'credentials-unavailable' }
     let resolved
     try {
-      resolved = await credentials.resolve(settings.apiKeyEnv)
+      resolved = await credentials.resolve(reference)
     } catch {
-      return { configured: false, reason: 'credentials-unavailable' }
+      return { reason: 'credentials-unavailable' }
     }
     if (resolved === undefined || typeof resolved.value !== 'string' || resolved.value === '') {
-      return { configured: false, reason: 'missing-key', key: settings.apiKeyEnv }
+      return { missing: true }
     }
+    return { value: resolved.value }
+  }
 
+  /**
+   * Swap a credential for a body, keeping the panels' shared error vocabulary.
+   * @param {string} reference - credential name.
+   * @param {string} url - endpoint to read.
+   * @param {(value: string) => Record<string, string>} headers - header builder.
+   * @param {(body: any) => boolean} failed - whether the body is an application-level error.
+   * @returns {Promise<{ body?: any, error?: string, status?: number, message?: string, missing?: boolean, reason?: string }>} outcome.
+   */
+  async function callPlan(reference, url, headers, failed) {
+    const key = await resolveKey(reference)
+    if (key.reason !== undefined) return { reason: key.reason }
+    if (key.missing === true) return { missing: true }
     let response
     try {
-      response = await fetch(`${settings.baseUrl}/api/monitor/usage/quota/limit`, {
-        headers: { authorization: resolved.value, accept: 'application/json' },
+      response = await fetch(url, {
+        headers: headers(key.value),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
     } catch (error) {
-      return { configured: true, error: 'network', message: String(error?.message ?? error) }
+      return { error: 'network', message: String(error?.message ?? error) }
     }
-    if (response.ok !== true) return { configured: true, error: 'http', status: response.status }
+    if (response.ok !== true) return { error: 'http', status: response.status }
     let body
     try {
       body = await response.json()
     } catch {
-      return { configured: true, error: 'invalid-json' }
+      return { error: 'invalid-json' }
     }
-    if (body?.success === false || (typeof body?.code === 'number' && body.code !== 200)) {
-      return { configured: true, error: 'api', message: String(body?.msg ?? 'quota request failed') }
+    if (failed(body) === true) {
+      return { error: 'api', message: String(body?.msg ?? body?.error?.message ?? 'quota request failed') }
+    }
+    return { body }
+  }
+
+  /**
+   * Read one plan, reusing its cache entry unless a refresh was asked for.
+   * @param {'glm' | 'opencode'} source - which plan to read.
+   * @param {boolean} force - ignore a fresh cache entry.
+   * @returns {Promise<object>} the snapshot payload.
+   */
+  async function readSource(source, force) {
+    const entry = cache.get(source)
+    if (force !== true && entry !== undefined && Date.now() - entry.at < settings.refreshSeconds * 1000) {
+      return entry.snapshot
     }
 
-    const snapshot = {
-      configured: true,
-      ...normalizeSnapshot(body),
-      fetchedAt: Date.now(),
-      baseUrl: settings.baseUrl,
-      activeModel: currentModel(ctx, sessionId),
-      defaultSelection: (() => {
-        try {
-          const selection = ctx.agentDefaultModel?.currentSelection?.()
-          return selection === undefined || selection === null
-            ? null
-            : {
-                provider: typeof selection.provider === 'string' ? selection.provider : null,
-                model: typeof selection.model === 'string' ? selection.model : null,
-                reasoningEffort:
-                  typeof selection.reasoningEffort === 'string' ? selection.reasoningEffort : null,
-              }
-        } catch {
-          return null
-        }
-      })(),
-
-
+    let outcome
+    let normalized
+    let keyReference = settings.apiKeyEnv
+    if (source === 'glm') {
+      outcome = await callPlan(
+        settings.apiKeyEnv,
+        `${settings.baseUrl}/api/monitor/usage/quota/limit`,
+        (value) => ({ authorization: value, accept: 'application/json' }),
+        (body) => body?.success === false || (typeof body?.code === 'number' && body.code !== 200),
+      )
+      if (outcome.body !== undefined) normalized = normalizeGlm(outcome.body)
+    } else {
+      keyReference = settings.opencodeApiKeyEnv
+      outcome = await callPlan(
+        settings.opencodeApiKeyEnv,
+        `${settings.opencodeBaseUrl}/usage`,
+        (value) => ({ authorization: `Bearer ${value}`, accept: 'application/json' }),
+        (body) => body?.usage === undefined,
+      )
+      if (outcome.body !== undefined) normalized = normalizeOpencode(outcome.body)
     }
-    cached = snapshot
-    cachedAt = now
+
+    let snapshot
+    if (normalized !== undefined) {
+      snapshot = {
+        configured: true,
+        source,
+        ...normalized,
+        fetchedAt: Date.now(),
+        baseUrl: source === 'glm' ? settings.baseUrl : settings.opencodeBaseUrl,
+      }
+    } else if (outcome.missing === true) {
+      snapshot = { configured: false, reason: 'missing-key', source, key: keyReference }
+    } else if (outcome.reason !== undefined) {
+      snapshot = { configured: false, reason: outcome.reason, source }
+    } else {
+      snapshot = {
+        configured: true,
+        source,
+        error: outcome.error,
+        ...(outcome.status === undefined ? {} : { status: outcome.status }),
+        ...(outcome.message === undefined ? {} : { message: outcome.message }),
+      }
+    }
+
+    cache.set(source, { at: Date.now(), snapshot })
     return snapshot
   }
 
@@ -218,10 +313,50 @@ export function apply(ctx, config = {}) {
       requestBody: 'buffered',
       fetch: async (request) => {
         const params = new URL(request.url).searchParams
-        const force = params.get('refresh') === '1'
         const sessionId = params.get('session') ?? undefined
         try {
-          return Response.json(await readQuota(force, sessionId), { headers: { 'cache-control': 'no-store' } })
+          const active = currentModel(ctx, sessionId)
+          const source = settings.source === 'auto' ? sourceFor(active.provider, active.model) : settings.source
+
+          /* The browser asks who the current plan is before it renders anything, so the
+           * gate never guesses from a model name and never touches an upstream endpoint. */
+          if (params.get('probe') === '1') {
+            return Response.json(
+              { source, provider: active.provider, model: active.model, origin: active.origin },
+              { headers: { 'cache-control': 'no-store' } },
+            )
+          }
+
+          if (source === null) {
+            return Response.json(
+              { configured: false, reason: 'unrelated-provider', source: null, activeModel: active },
+              { headers: { 'cache-control': 'no-store' } },
+            )
+          }
+
+          const snapshot = await readSource(source, params.get('refresh') === '1')
+          return Response.json(
+            {
+              ...snapshot,
+              activeModel: active,
+              defaultSelection: (() => {
+                try {
+                  const selection = ctx.agentDefaultModel?.currentSelection?.()
+                  return selection === undefined || selection === null
+                    ? null
+                    : {
+                        provider: typeof selection.provider === 'string' ? selection.provider : null,
+                        model: typeof selection.model === 'string' ? selection.model : null,
+                        reasoningEffort:
+                          typeof selection.reasoningEffort === 'string' ? selection.reasoningEffort : null,
+                      }
+                } catch {
+                  return null
+                }
+              })(),
+            },
+            { headers: { 'cache-control': 'no-store' } },
+          )
         } catch (error) {
           return Response.json({ configured: true, error: 'internal', message: String(error?.message ?? error) })
         }

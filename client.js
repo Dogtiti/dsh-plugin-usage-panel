@@ -30,6 +30,7 @@ window.__ModuleLoader__.load({
       { id: 'fiveHour', accent: '#2f6fed' },
       { id: 'weekly', accent: '#16a34a' },
       { id: 'tools', accent: '#7c3aed' },
+      { id: 'monthly', accent: '#0891b2' },
     ]
 
     /** Labels for both shipped languages, registered into the app locale service. */
@@ -38,6 +39,9 @@ window.__ModuleLoader__.load({
         fiveHour: '5 小时',
         weekly: '每周',
         tools: '工具调用',
+        monthly: '每月',
+        planGlm: 'GLM Coding Plan',
+        planOpencode: 'OpenCode Go',
         title: '剩余额度',
         level: '套餐',
         resets: '重置',
@@ -53,6 +57,9 @@ window.__ModuleLoader__.load({
         fiveHour: '5h',
         weekly: 'Week',
         tools: 'Tools',
+        monthly: 'Month',
+        planGlm: 'GLM Coding Plan',
+        planOpencode: 'OpenCode Go',
         title: 'Remaining quota',
         level: 'Plan',
         resets: 'resets',
@@ -180,6 +187,8 @@ window.__ModuleLoader__.load({
       const [open, setOpen] = React.useState(false)
       const [hovered, setHovered] = React.useState(false)
       const [modelText, setModelText] = React.useState(() => composerModelText())
+      /** 'glm' | 'opencode' | null — which plan the Host says this session is running. */
+      const [source, setSource] = React.useState(null)
       const rootRef = React.useRef(null)
       const closeTimer = React.useRef(null)
       const openTimer = React.useRef(null)
@@ -193,6 +202,28 @@ window.__ModuleLoader__.load({
         const timer = setInterval(() => setModelText(composerModelText()), 2000)
         return () => clearInterval(timer)
       }, [])
+
+      /* Ask the Host which plan the current model belongs to. This is a local route
+       * that reads session events only, so it costs nothing and never guesses from the
+       * model name: `deepseek-v4.1-flash` exists on several providers. */
+      React.useEffect(() => {
+        let alive = true
+        void (async () => {
+          try {
+            const query = typeof sessionId === 'string' && sessionId !== ''
+              ? `?probe=1&session=${encodeURIComponent(sessionId)}`
+              : '?probe=1'
+            const response = await fetch(`${ROUTE}${query}`, { headers: { accept: 'application/json' } })
+            const body = await response.json()
+            if (alive) setSource(typeof body.source === 'string' ? body.source : null)
+          } catch {
+            if (alive) setSource(null)
+          }
+        })()
+        return () => {
+          alive = false
+        }
+      }, [sessionId, modelText])
 
       React.useEffect(
         () => () => {
@@ -247,8 +278,8 @@ window.__ModuleLoader__.load({
         }
       }, [open, sessionId])
 
-      /* Any other model has no coding-plan quota here. */
-      if (!/glm/i.test(modelText)) return null
+      /* The Host names the plan for this session; nothing else is read as a guess. */
+      if (source === null) return null
 
       const windows = Array.isArray(snapshot?.windows) ? snapshot.windows : []
       const columns = WINDOWS.map((entry) => ({ entry, win: windows.find((win) => win.id === entry.id) })).filter(
@@ -353,21 +384,31 @@ window.__ModuleLoader__.load({
                 'div',
                 { style: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '12px', marginBottom: '14px' } },
                 h('span', { style: { fontSize: '14px', fontWeight: 600 } }, t('title')),
-                typeof snapshot?.level === 'string' && snapshot.level !== ''
-                  ? h(
-                      'span',
-                      {
-                        style: {
-                          fontSize: '11px',
-                          padding: '1px 7px',
-                          borderRadius: '999px',
-                          background: 'rgba(124,58,237,0.10)',
-                          color: '#6d28d9',
-                        },
+                (() => {
+                  const plan = snapshot?.source === 'glm'
+                    ? t('planGlm')
+                    : snapshot?.source === 'opencode'
+                      ? t('planOpencode')
+                      : null
+                  const badge = typeof snapshot?.level === 'string' && snapshot.level !== ''
+                    ? `${plan ?? ''} ${snapshot.level}`.trim()
+                    : plan
+                  if (badge === null || badge === '') return null
+                  return h(
+                    'span',
+                    {
+                      style: {
+                        fontSize: '11px',
+                        padding: '1px 7px',
+                        borderRadius: '999px',
+                        background: 'rgba(124,58,237,0.10)',
+                        color: '#6d28d9',
+                        whiteSpace: 'nowrap',
                       },
-                      `${t('level')} ${snapshot.level}`,
-                    )
-                  : null,
+                    },
+                    badge,
+                  )
+                })(),
               ),
               snapshot === null
                 ? h('div', { style: { fontSize: '12px', opacity: 0.6 } }, t('loading'))

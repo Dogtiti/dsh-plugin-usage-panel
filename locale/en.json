@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Usage Panel",
-    "description": "Shows how much of each provider quota window is left, as a chip next to the model selector with a detail popover. GLM Coding Plan today."
+    "description": "Shows how much of each provider quota window is left (GLM Coding Plan, OpenCode Zen) as a chip beside the model selector, with a detail popover."
   },
   "fiveHour": "5h",
   "weekly": "Week",
@@ -12,5 +12,8 @@
   "unconfigured": "No Zhipu API key",
   "failed": "Quota unavailable",
   "updated": "Updated",
-  "remaining": "remaining"
+  "remaining": "remaining",
+  "monthly": "Month",
+  "planGlm": "GLM Coding Plan",
+  "planOpencode": "OpenCode Go"
 }
