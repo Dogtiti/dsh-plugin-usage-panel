@@ -218,7 +218,9 @@ window.__ModuleLoader__.load({
       const closeTimer = React.useRef(null)
       const openTimer = React.useRef(null)
       const inFlight = React.useRef(false)
-      const cache = React.useRef({ at: 0, body: null })
+      /* Keyed by session + provider: a body fetched for one plan must never be reused
+       * after switching sessions or providers. */
+      const cache = React.useRef({ key: '', at: 0, body: null })
       /* Re-render on a language switch so the labels follow the app. */
       React.useSyncExternalStore(locale.subscribe, locale.getSnapshot, locale.getSnapshot)
 
@@ -240,25 +242,44 @@ window.__ModuleLoader__.load({
         return `?${parts.join('&')}`
       }
 
-      /* Ask the Host which plan the current model belongs to. This is a local route
-       * that reads session events only, so it costs nothing and never guesses from the
-       * model name: `deepseek-v4.1-flash` exists on several providers. */
+      /* Ask the Host which plan the current model belongs to. The route is local and only
+       * reads what the selector shows, so polling it is cheap. It polls rather than relying
+       * on the effect dependencies: right after a session switch the selector still renders
+       * the previous session's provider, and nothing would change again to retrigger it. */
       React.useEffect(() => {
         let alive = true
-        void (async () => {
+        const ask = async () => {
           try {
-            const query = probeQuery()
-            const response = await fetch(`${ROUTE}${query}`, { headers: { accept: 'application/json' } })
+            const response = await fetch(`${ROUTE}${probeQuery()}`, { headers: { accept: 'application/json' } })
             const body = await response.json()
-            if (alive) setSource(typeof body.source === 'string' ? body.source : null)
+            if (alive !== true) return
+            const next = typeof body.source === 'string' ? body.source : null
+            setSource((previous) => {
+              if (previous !== null && next !== previous) {
+                /* Numbers from the other plan must not linger next to the new one. */
+                cache.current = { key: '', at: 0, body: null }
+                setSnapshot(null)
+              }
+              return next
+            })
           } catch {
             if (alive) setSource(null)
           }
-        })()
+        }
+        void ask()
+        const timer = setInterval(() => void ask(), 2000)
         return () => {
           alive = false
+          clearInterval(timer)
         }
       }, [sessionId, modelText, providerId])
+
+      React.useEffect(() => {
+        /* Switching sessions starts from nothing: the previous plan's numbers are not
+         * this session's numbers. */
+        cache.current = { key: '', at: 0, body: null }
+        setSnapshot(null)
+      }, [sessionId])
 
       React.useEffect(
         () => () => {
@@ -274,7 +295,8 @@ window.__ModuleLoader__.load({
         let alive = true
         /* A snapshot younger than the window is served from memory: re-hovering a few
          * times in a row must not hammer the upstream endpoint. */
-        if (cache.current.body !== null && Date.now() - cache.current.at < MIN_FETCH_MS) {
+        const cacheKey = `${typeof sessionId === 'string' ? sessionId : ''}|${providerId}`
+        if (cache.current.body !== null && cache.current.key === cacheKey && Date.now() - cache.current.at < MIN_FETCH_MS) {
           setSnapshot(cache.current.body)
         } else if (inFlight.current !== true) {
           inFlight.current = true
@@ -288,7 +310,7 @@ window.__ModuleLoader__.load({
               params.push('refresh=1')
               const response = await fetch(`${ROUTE}?${params.join('&')}`, { headers: { accept: 'application/json' } })
               const body = await response.json()
-              cache.current = { at: Date.now(), body }
+              cache.current = { key: cacheKey, at: Date.now(), body }
               if (alive) setSnapshot(body)
             } catch (error) {
               if (alive) {
@@ -312,7 +334,7 @@ window.__ModuleLoader__.load({
           document.removeEventListener('pointerdown', onPointer)
           document.removeEventListener('keydown', onKey)
         }
-      }, [open, sessionId])
+      }, [open, sessionId, providerId])
 
       /* The Host names the plan for this session; nothing else is read as a guess. */
       if (source === null) return null
