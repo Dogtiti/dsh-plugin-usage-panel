@@ -59,11 +59,14 @@ OpenCode 返回的是三个窗口的使用百分比：
 - 挂在 `conversation.input.activity`：**输入框工具行里、模型选择器右侧紧邻**。
   （布局没有"模型左侧"的插槽：`conversation.input.left` 是最左边那一簇，而模型选择器本身是 single 槽，不能被扩展。）
 - 渲染前先问 Host 一次 `?probe=1`（纯本地、不打上游），Host 用会话的 `model/selection` 事件得出 provider：
-  - `zai` / `zai-coding-cn` 这类 → `glm`
-  - `opencode-go` 这类 → `opencode`
-  - 其他（含 `newapi` 网关）→ 隐藏图标
+  判断顺序：
+
+  1. **模型控件上的 `data-provider-id`**（选择器自己渲染的属性，就是用户眼前那个）→ 最优先
+  2. 会话的 `model/selection` 事件（会话记录过选择时）
+  3. 都没有 → 隐藏图标
 
   为什么不能只看模型名：`deepseek-v4.1-flash` 这类模型同时挂在多个供应商下，名字分不出归属。
+  为什么不能退到「profile 默认模型」：新会话在第一次选择被记录前没有事件，而默认模型未必是用户刚切换的那个——之前就因此把 GLM 会话显示成了 OpenCode。
 
 ## 显示内容
 

@@ -97,6 +97,29 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The provider the model control is showing, read from the `data-provider-id`
+     * attribute the selector already puts on its label. This is the committed value
+     * the user is looking at, so it survives sessions that recorded no selection yet.
+     * @returns {string} provider id, or '' when unreadable.
+     */
+    function composerProviderId() {
+      try {
+        const control =
+          document.querySelector('[aria-label^="选择模型"]') ??
+          document.querySelector('[aria-label*="当前:"]') ??
+          document.querySelector('[aria-label^="Select model"]') ??
+          document.querySelector('[aria-label*="current:"]')
+        if (control === null) return ''
+        const mark =
+          control.querySelector('[data-provider-id]') ??
+          (control.closest('[data-provider-id]') ?? undefined)
+        return (mark?.getAttribute('data-provider-id') ?? '').trim()
+      } catch {
+        return ''
+      }
+    }
+
+    /**
      * Format a reset timestamp as a date in the active interface language.
      * @param {number} ms - epoch milliseconds.
      * @returns {string} a localized short date, or an empty string.
@@ -187,6 +210,8 @@ window.__ModuleLoader__.load({
       const [open, setOpen] = React.useState(false)
       const [hovered, setHovered] = React.useState(false)
       const [modelText, setModelText] = React.useState(() => composerModelText())
+      /** Provider id shown by the model control; '' when the selector exposes none. */
+      const [providerId, setProviderId] = React.useState(() => composerProviderId())
       /** 'glm' | 'opencode' | null — which plan the Host says this session is running. */
       const [source, setSource] = React.useState(null)
       const rootRef = React.useRef(null)
@@ -199,9 +224,21 @@ window.__ModuleLoader__.load({
 
       /* The label changes without a re-render here; a cheap read keeps the gate honest. */
       React.useEffect(() => {
-        const timer = setInterval(() => setModelText(composerModelText()), 2000)
+        const timer = setInterval(() => {
+          setModelText(composerModelText())
+          setProviderId(composerProviderId())
+        }, 2000)
         return () => clearInterval(timer)
       }, [])
+
+      /** Query string for both calls: session for the selection events, provider from the DOM. */
+      const probeQuery = () => {
+        const parts = []
+        if (typeof sessionId === 'string' && sessionId !== '') parts.push(`session=${encodeURIComponent(sessionId)}`)
+        if (providerId !== '') parts.push(`provider=${encodeURIComponent(providerId)}`)
+        parts.push('probe=1')
+        return `?${parts.join('&')}`
+      }
 
       /* Ask the Host which plan the current model belongs to. This is a local route
        * that reads session events only, so it costs nothing and never guesses from the
@@ -210,9 +247,7 @@ window.__ModuleLoader__.load({
         let alive = true
         void (async () => {
           try {
-            const query = typeof sessionId === 'string' && sessionId !== ''
-              ? `?probe=1&session=${encodeURIComponent(sessionId)}`
-              : '?probe=1'
+            const query = probeQuery()
             const response = await fetch(`${ROUTE}${query}`, { headers: { accept: 'application/json' } })
             const body = await response.json()
             if (alive) setSource(typeof body.source === 'string' ? body.source : null)
@@ -223,7 +258,7 @@ window.__ModuleLoader__.load({
         return () => {
           alive = false
         }
-      }, [sessionId, modelText])
+      }, [sessionId, modelText, providerId])
 
       React.useEffect(
         () => () => {
@@ -249,6 +284,7 @@ window.__ModuleLoader__.load({
               if (typeof sessionId === 'string' && sessionId !== '') {
                 params.push(`session=${encodeURIComponent(sessionId)}`)
               }
+              if (providerId !== '') params.push(`provider=${encodeURIComponent(providerId)}`)
               params.push('refresh=1')
               const response = await fetch(`${ROUTE}?${params.join('&')}`, { headers: { accept: 'application/json' } })
               const body = await response.json()

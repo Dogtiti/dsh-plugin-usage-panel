@@ -316,13 +316,31 @@ export function apply(ctx, config = {}) {
         const sessionId = params.get('session') ?? undefined
         try {
           const active = currentModel(ctx, sessionId)
-          const source = settings.source === 'auto' ? sourceFor(active.provider, active.model) : settings.source
+          /* The composer reports the provider it is displaying. It outranks the session
+           * events, which are empty until a session records its first selection — the
+           * fallback there is the profile default, and that is not what the user sees. */
+          const shownProvider = params.get('provider')
+          /* Only a recorded selection counts. The profile default is what a *new* session
+           * would start from, so deriving a plan from it shows the wrong card in any
+           * session the user switched by hand — hide instead of guessing. */
+          const fromSession = active.origin === 'session' ? sourceFor(active.provider, active.model) : null
+          const source =
+            settings.source === 'auto'
+              ? shownProvider !== null && shownProvider !== ''
+                ? sourceFor(shownProvider, null)
+                : fromSession
+              : settings.source
 
           /* The browser asks who the current plan is before it renders anything, so the
            * gate never guesses from a model name and never touches an upstream endpoint. */
           if (params.get('probe') === '1') {
             return Response.json(
-              { source, provider: active.provider, model: active.model, origin: active.origin },
+              {
+                source,
+                provider: shownProvider !== null && shownProvider !== '' ? shownProvider : active.provider,
+                model: active.model,
+                origin: shownProvider !== null && shownProvider !== '' ? 'composer' : active.origin,
+              },
               { headers: { 'cache-control': 'no-store' } },
             )
           }
